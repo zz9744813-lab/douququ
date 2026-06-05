@@ -182,10 +182,13 @@ export const api = {
   getBattles: (worldId: string) => request<Battle[]>(`/worlds/${worldId}/battles`),
 
   // Turns
-  advanceTurn: (worldId: string) => request<TurnResult>(`/worlds/${worldId}/turns/next`, { method: 'POST' }),
-  autoRun: (worldId: string, turns: number = 10) =>
-    request<{ turns_run: number; results: TurnResult[] }>(`/worlds/${worldId}/turns/auto-run?turns=${turns}`, { method: 'POST' }),
+  advanceTurn: (worldId: string, use_llm: boolean = false) =>
+    request<TurnResult>(`/worlds/${worldId}/turns/next?use_llm=${use_llm}`, { method: 'POST' }),
+  autoRun: (worldId: string, turns: number = 10, use_llm: boolean = false) =>
+    request<{ turns_run: number; results: TurnResult[] }>(`/worlds/${worldId}/turns/auto-run?turns=${turns}&use_llm=${use_llm}`, { method: 'POST' }),
   pauseWorld: (worldId: string) => request<{ ok: boolean }>(`/worlds/${worldId}/turns/pause`, { method: 'POST' }),
   resumeWorld: (worldId: string) => request<{ ok: boolean }>(`/worlds/${worldId}/turns/resume`, { method: 'POST' }),
   getTurnRecords: (worldId: string) => request<TurnRecord[]>(`/worlds/${worldId}/turns`),
+  getTurnReplay: (worldId: string, turn: number) =>
+    request<{ turn: number; summary: string; timeline: Array<Record<string, unknown>> }>(`/worlds/${worldId}/turns/${turn}/replay`),
 };
