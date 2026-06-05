@@ -4,13 +4,14 @@ interface Props {
   events: WorldEvent[];
   battles: Battle[];
   sects: Sect[];
+  onSelectTurn?: (turn: number) => void;
 }
 
 function getSectName(sects: Sect[], id: string): string {
   return sects.find((s) => s.id === id)?.name || id;
 }
 
-export default function EventFeed({ events, battles, sects }: Props) {
+export default function EventFeed({ events, battles, sects, onSelectTurn }: Props) {
   // Combine and sort events and battles
   const timeline: Array<{
     turn: number;
@@ -31,7 +32,11 @@ export default function EventFeed({ events, battles, sects }: Props) {
         if (item.type === 'event') {
           const evt = item.data as WorldEvent;
           return (
-            <div key={`evt-${idx}`} className="bg-slate-800 rounded-lg p-3 border border-slate-700">
+            <div
+              key={`evt-${idx}`}
+              className="bg-slate-800 rounded-lg p-3 border border-slate-700 cursor-pointer hover:border-slate-500 transition-colors"
+              onClick={() => onSelectTurn?.(evt.turn)}
+            >
               <div className="flex items-center justify-between mb-1">
                 <span className="text-xs text-slate-500">回合 {evt.turn}</span>
                 <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
@@ -52,7 +57,11 @@ export default function EventFeed({ events, battles, sects }: Props) {
             crushing_defeat: 'text-red-400',
           };
           return (
-            <div key={`btl-${idx}`} className="bg-slate-800 rounded-lg p-3 border border-slate-700">
+            <div
+              key={`btl-${idx}`}
+              className="bg-slate-800 rounded-lg p-3 border border-slate-700 cursor-pointer hover:border-slate-500 transition-colors"
+              onClick={() => onSelectTurn?.(battle.turn)}
+            >
               <div className="flex items-center justify-between mb-1">
                 <span className="text-xs text-slate-500">回合 {battle.turn}</span>
                 <span className={`text-xs font-medium ${resultColors[battle.result_type] || 'text-slate-400'}`}>
