@@ -7,6 +7,7 @@ import type { Sect, Region } from '../api/client';
 import WorldMap from '../components/WorldMap';
 import EventFeed from '../components/EventFeed';
 import SectCard from '../components/SectCard';
+import TurnReplayPanel from '../components/TurnReplayPanel';
 
 const SECT_COLORS: Record<string, string> = {
   sword: '#ef4444', alchemy: '#22c55e', formation: '#3b82f6',
@@ -20,6 +21,8 @@ export default function WorldRunPage() {
   const store = useWorldStore();
   const [selectedSect, setSelectedSect] = useState<Sect | null>(null);
   const [turnCount, setTurnCount] = useState(1);
+  const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
+  const useLlm = store.useLlm;
 
   useEffect(() => {
     if (worldId) store.loadWorld(worldId);
@@ -34,7 +37,10 @@ export default function WorldRunPage() {
 
   const handleNextTurn = useCallback(async () => {
     if (!worldId) return;
-    await store.advanceTurn(worldId);
+    const result = await store.advanceTurn(worldId);
+    if (result) {
+      setSelectedTurn(result.turn);
+    }
   }, [worldId, store]);
 
   const handleAutoRun = useCallback(async () => {
@@ -82,6 +88,18 @@ export default function WorldRunPage() {
 
         <div className="flex items-center gap-3">
           <span className="text-slate-400 text-sm">回合 {world.current_turn}{world.max_turns ? `/${world.max_turns}` : ''}</span>
+          {/* LLM Mode Toggle */}
+          <button
+            onClick={() => store.setUseLlm(!useLlm)}
+            className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+              useLlm
+                ? 'bg-purple-600/30 text-purple-300 border border-purple-500/50 hover:bg-purple-600/40'
+                : 'bg-slate-700 text-slate-400 border border-slate-600 hover:bg-slate-600'
+            }`}
+            title={useLlm ? 'LLM Agent 模式已开启' : '默认 AI 模式'}
+          >
+            {useLlm ? '🤖 LLM' : '⚙️ 默认AI'}
+          </button>
           {(world.status === 'running' || world.status === 'created') && (
             <>
               <input
@@ -121,7 +139,7 @@ export default function WorldRunPage() {
               sect={sect}
               regions={regions || []}
               isSelected={selectedSect?.id === sect.id}
-              onClick={() => setSelectedSect(sect)}
+              onClick={() => { setSelectedSect(sect); setSelectedTurn(null); }}
             />
           ))}
         </aside>
@@ -135,14 +153,20 @@ export default function WorldRunPage() {
             selectedSectId={selectedSect?.id}
             onSelectSect={(id) => {
               const s = store.sects.find((x) => x.id === id);
-              if (s) setSelectedSect(s);
+              if (s) { setSelectedSect(s); setSelectedTurn(null); }
             }}
           />
         </main>
 
         {/* Right: Detail Panel */}
         <aside className="w-80 bg-slate-850 border-l border-slate-700 overflow-y-auto shrink-0">
-          {selectedSect ? (
+          {selectedTurn ? (
+            <TurnReplayPanel
+              worldId={worldId!}
+              turn={selectedTurn}
+              onClose={() => setSelectedTurn(null)}
+            />
+          ) : selectedSect ? (
             <div className="p-4">
               <h3 className="text-lg font-bold text-white mb-3">{selectedSect.name}</h3>
               <div className="flex items-center gap-2 mb-4">
@@ -223,7 +247,12 @@ export default function WorldRunPage() {
           ) : (
             <div className="p-4">
               <h3 className="text-lg font-bold text-white mb-3">事件流</h3>
-              <EventFeed events={store.events} battles={store.battles} sects={store.sects} />
+              <EventFeed
+                events={store.events}
+                battles={store.battles}
+                sects={store.sects}
+                onSelectTurn={(turn) => setSelectedTurn(turn)}
+              />
             </div>
           )}
         </aside>
