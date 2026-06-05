@@ -4,6 +4,7 @@ import WorldListPage from './pages/WorldListPage';
 import WorldCreatePage from './pages/WorldCreatePage';
 import WorldRunPage from './pages/WorldRunPage';
 import WorldDetailPage from './pages/WorldDetailPage';
+import ModelConfigPage from './pages/ModelConfigPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -21,6 +22,7 @@ export default function App() {
             <Route path="/create" element={<WorldCreatePage />} />
             <Route path="/worlds/:worldId" element={<WorldRunPage />} />
             <Route path="/worlds/:worldId/detail" element={<WorldDetailPage />} />
+            <Route path="/settings/models" element={<ModelConfigPage />} />
           </Routes>
         </div>
       </BrowserRouter>
