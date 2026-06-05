@@ -87,7 +87,7 @@ class RuleEngine:
 
     @staticmethod
     def resolve_action(action: dict, sect_state: dict, world_state: dict) -> dict:
-        """结算单个行动，返回行动结果"""
+        """结算单个行动，返回行动结果。资源消耗由 ACTION_RESOURCE_COST 统一扣除，这里只处理收益。"""
         action_type = action.get("type", "")
         intensity = action.get("intensity", "medium")
         result = {"action_type": action_type, "success": True, "effects": {}, "log": ""}
@@ -96,22 +96,22 @@ class RuleEngine:
 
         if action_type == "train_disciples":
             gain = int(10 * intensity_mult * random.uniform(0.8, 1.2))
-            result["effects"] = {"military_power": gain, "spirit_stones": -50}
+            result["effects"] = {"military_power": gain}
             result["log"] = f"训练弟子，军事力量 +{gain}"
 
         elif action_type == "build_structure":
             gain = int(8 * intensity_mult * random.uniform(0.8, 1.2))
-            result["effects"] = {"economy": gain, "spirit_stones": -200}
+            result["effects"] = {"economy": gain}
             result["log"] = f"建设建筑，经济能力 +{gain}"
 
         elif action_type == "make_pills":
             gain = int(6 * intensity_mult * random.uniform(0.8, 1.2))
-            result["effects"] = {"pills": gain, "spirit_stones": -80}
+            result["effects"] = {"pills": gain}
             result["log"] = f"炼制丹药，获得 {gain} 枚丹药"
 
         elif action_type == "craft_artifacts":
             gain = int(5 * intensity_mult * random.uniform(0.8, 1.2))
-            result["effects"] = {"artifacts": gain, "spirit_stones": -100}
+            result["effects"] = {"artifacts": gain}
             result["log"] = f"炼制法器，获得 {gain} 件法器"
 
         elif action_type == "explore_realm":
@@ -123,7 +123,7 @@ class RuleEngine:
                 result["tags"] = ["奇遇"]
             elif luck < 0.4:
                 loss = int(5 * intensity_mult)
-                result["effects"] = {"military_power": -loss, "spirit_stones": -60}
+                result["effects"] = {"military_power": -loss}
                 result["log"] = f"秘境探索遭遇危险，损失 {loss} 战力"
                 result["success"] = False
             else:
@@ -132,11 +132,11 @@ class RuleEngine:
                 result["log"] = f"秘境探索有所收获，获得 {gain*5} 灵石"
 
         elif action_type == "spy_gather":
-            result["effects"] = {"intelligence": 5, "spirit_stones": -40}
+            result["effects"] = {"intelligence": 5}
             result["log"] = "情报刺探成功，获得敌方动向信息"
 
         elif action_type == "propaganda":
-            result["effects"] = {"reputation": 3, "spirit_stones": -40}
+            result["effects"] = {"reputation": 3}
             result["log"] = "宣传造势，声望提升"
 
         elif action_type == "rest":
@@ -144,6 +144,18 @@ class RuleEngine:
             result["log"] = "休养生息，恢复少量灵石"
 
         return result
+
+    @staticmethod
+    def deduct_cost(sect_state: dict, action_type: str) -> dict:
+        """统一扣除行动成本。返回扣除的资源列表。"""
+        resources = sect_state.get("resources", {})
+        cost = RuleEngine.ACTION_RESOURCE_COST.get(action_type, {})
+        deducted = {}
+        for res_key, amount in cost.items():
+            old = resources.get(res_key, 0)
+            resources[res_key] = max(0, old - amount)
+            deducted[res_key] = amount
+        return deducted
 
     @staticmethod
     def apply_effects(sect_resources: dict, sect_stats: dict, effects: dict):
