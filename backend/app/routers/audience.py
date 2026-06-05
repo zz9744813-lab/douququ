@@ -6,11 +6,13 @@ from pydantic import BaseModel, Field
 
 from app.core.database import get_db
 from app.services.audience_engine import AudienceEngine
+from app.services.audience_interaction_engine import AudienceInteractionEngine
 from app.services.scoring_engine import ScoringEngine
 from app.models.world import World
 from app.models.sect import Sect
 from app.models.battle import Battle
 from app.models.diplomacy import DiplomacyRelation
+from app.models.audience_interaction import AudiencePrediction, AudienceIntervention
 
 router = APIRouter(prefix="/api/worlds", tags=["audience"])
 
@@ -170,3 +172,102 @@ def get_season_report(world_id: str, db: Session = Depends(get_db)):
     )
 
     return report
+
+
+# === 新版天道互动 API ===
+
+class NewPredictRequest(BaseModel):
+    prediction_type: str = Field(..., description="winner, next_war, annexation, alliance")
+    target_sect_id: str | None = None
+    predicted_turn: int | None = None
+
+
+class NewInterveneRequest(BaseModel):
+    intervention_type: str = Field(..., description="bless, curse, resource_rain, revelation, disaster, divine_intervention")
+    target_sect_id: str | None = None
+    target_region_id: str | None = None
+
+
+@router.post("/{world_id}/audience/predictions")
+def create_prediction(world_id: str, req: NewPredictRequest, user_id: str = "anonymous", db: Session = Depends(get_db)):
+    """创建预测"""
+    world = db.query(World).filter(World.id == world_id).first()
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+    engine = AudienceInteractionEngine(db)
+    result = engine.create_prediction(world_id, user_id, req.prediction_type, req.target_sect_id, req.predicted_turn)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.get("/{world_id}/audience/predictions")
+def list_predictions(world_id: str, user_id: str | None = None, db: Session = Depends(get_db)):
+    """获取预测列表"""
+    query = db.query(AudiencePrediction).filter(AudiencePrediction.world_id == world_id)
+    if user_id:
+        query = query.filter(AudiencePrediction.user_id == user_id)
+    preds = query.order_by(AudiencePrediction.created_at.desc()).all()
+    return [_prediction_to_dict(p) for p in preds]
+
+
+@router.post("/{world_id}/audience/interventions")
+def create_intervention(world_id: str, req: NewInterveneRequest, user_id: str = "anonymous", db: Session = Depends(get_db)):
+    """创建天道干预"""
+    world = db.query(World).filter(World.id == world_id).first()
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+    engine = AudienceInteractionEngine(db)
+    result = engine.create_intervention(world_id, world.current_turn, user_id, req.intervention_type, req.target_sect_id, req.target_region_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.get("/{world_id}/audience/interventions")
+def list_interventions(world_id: str, user_id: str | None = None, db: Session = Depends(get_db)):
+    """获取干预历史"""
+    query = db.query(AudienceIntervention).filter(AudienceIntervention.world_id == world_id)
+    if user_id:
+        query = query.filter(AudienceIntervention.user_id == user_id)
+    interventions = query.order_by(AudienceIntervention.turn.desc()).all()
+    return [_intervention_to_dict(i) for i in interventions]
+
+
+@router.get("/audience/intervention-types")
+def get_intervention_types():
+    """获取可用的干预类型"""
+    return AudienceInteractionEngine.INTERVENTION_TYPES
+
+
+def _prediction_to_dict(p: AudiencePrediction) -> dict:
+    return {
+        "id": p.id,
+        "world_id": p.world_id,
+        "user_id": p.user_id,
+        "prediction_type": p.prediction_type,
+        "target_sect_id": p.target_sect_id,
+        "target_sect_name": p.target_sect_name,
+        "predicted_turn": p.predicted_turn,
+        "status": p.status,
+        "resolved_turn": p.resolved_turn,
+        "reward_points": p.reward_points,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+def _intervention_to_dict(i: AudienceIntervention) -> dict:
+    return {
+        "id": i.id,
+        "world_id": i.world_id,
+        "turn": i.turn,
+        "user_id": i.user_id,
+        "intervention_type": i.intervention_type,
+        "target_sect_id": i.target_sect_id,
+        "target_sect_name": i.target_sect_name,
+        "title": i.title,
+        "description": i.description,
+        "effects": json.loads(i.effects_json or "{}"),
+        "cost_points": i.cost_points,
+        "created_at": i.created_at.isoformat() if i.created_at else None,
+    }

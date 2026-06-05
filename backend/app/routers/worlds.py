@@ -6,13 +6,16 @@ from pydantic import BaseModel, Field
 
 from app.core.database import get_db
 from app.services.world_service import WorldService
+from app.services.diplomacy_proposal_engine import DiplomacyProposalEngine
 from app.models.world import World
 from app.models.sect import Sect
 from app.models.region import Region
 from app.models.diplomacy import DiplomacyRelation
+from app.models.diplomacy_proposal import DiplomacyProposal
 from app.models.event import WorldEvent
 from app.models.turn import TurnRecord
 from app.models.battle import Battle
+from app.models.character import Character
 
 router = APIRouter(prefix="/api/worlds", tags=["worlds"])
 
@@ -256,6 +259,116 @@ def get_turn_replay(world_id: str, turn: int, db: Session = Depends(get_db)):
     }
 
 
+@router.get("/{world_id}/characters")
+def get_world_characters(world_id: str, sect_id: str | None = None, role: str | None = None, db: Session = Depends(get_db)):
+    """获取世界角色列表，可按宗门或角色类型筛选"""
+    query = db.query(Character).filter(Character.world_id == world_id)
+    if sect_id:
+        query = query.filter(Character.sect_id == sect_id)
+    if role:
+        query = query.filter(Character.role == role)
+    chars = query.all()
+    return [_character_to_dict(c) for c in chars]
+
+
+@router.get("/{world_id}/characters/{char_id}")
+def get_character_detail(world_id: str, char_id: str, db: Session = Depends(get_db)):
+    """获取角色详情"""
+    char = db.query(Character).filter(Character.world_id == world_id, Character.id == char_id).first()
+    if not char:
+        raise HTTPException(status_code=404, detail="角色不存在")
+    return _character_to_dict(char)
+
+
+# --- 外交提案 API ---
+
+class CreateProposalRequest(BaseModel):
+    from_sect_id: str
+    to_sect_id: str
+    proposal_type: str = Field(..., description="trade, non_aggression, alliance, vassal, secret_pact, ceasefire, threat")
+    conditions: dict = Field(default_factory=dict)
+    is_secret: bool = False
+
+
+@router.post("/{world_id}/diplomacy/proposals")
+def create_proposal(world_id: str, req: CreateProposalRequest, db: Session = Depends(get_db)):
+    """创建外交提案"""
+    world = db.query(World).filter(World.id == world_id).first()
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+
+    engine = DiplomacyProposalEngine(db)
+    result = engine.create_proposal(
+        world_id=world_id,
+        turn=world.current_turn,
+        from_sect_id=req.from_sect_id,
+        to_sect_id=req.to_sect_id,
+        proposal_type=req.proposal_type,
+        conditions=req.conditions,
+        is_secret=req.is_secret,
+        auto_resolve=True,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.get("/{world_id}/diplomacy/proposals")
+def list_proposals(world_id: str, sect_id: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    """获取外交提案列表"""
+    query = db.query(DiplomacyProposal).filter(DiplomacyProposal.world_id == world_id)
+    if sect_id:
+        query = query.filter(
+            (DiplomacyProposal.from_sect_id == sect_id) | (DiplomacyProposal.to_sect_id == sect_id)
+        )
+    if status:
+        query = query.filter(DiplomacyProposal.status == status)
+    proposals = query.order_by(DiplomacyProposal.turn.desc()).all()
+    return [_proposal_to_dict(p) for p in proposals]
+
+
+@router.get("/{world_id}/diplomacy/proposals/{proposal_id}")
+def get_proposal(world_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    """获取提案详情"""
+    p = db.query(DiplomacyProposal).filter(DiplomacyProposal.world_id == world_id, DiplomacyProposal.id == proposal_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="提案不存在")
+    return _proposal_to_dict(p)
+
+
+@router.post("/{world_id}/diplomacy/proposals/{proposal_id}/resolve")
+def resolve_proposal(world_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    """手动结算提案（接受/拒绝）"""
+    world = db.query(World).filter(World.id == world_id).first()
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+    engine = DiplomacyProposalEngine(db)
+    result = engine.resolve_proposal(proposal_id, world.current_turn)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.post("/{world_id}/diplomacy/proposals/{proposal_id}/betray")
+def betray_proposal(world_id: str, proposal_id: str, betrayer_sect_id: str, reason: str = "", db: Session = Depends(get_db)):
+    """背叛条约"""
+    world = db.query(World).filter(World.id == world_id).first()
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+    engine = DiplomacyProposalEngine(db)
+    result = engine.betray_proposal(proposal_id, betrayer_sect_id, world.current_turn, reason)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.get("/{world_id}/diplomacy/treaties")
+def get_active_treaties(world_id: str, sect_id: str | None = None, db: Session = Depends(get_db)):
+    """获取有效条约"""
+    engine = DiplomacyProposalEngine(db)
+    return engine.get_active_treaties(world_id, sect_id)
+
+
 # --- Helper functions ---
 
 def _world_to_dict(w: World) -> dict:
@@ -340,6 +453,55 @@ def _battle_to_dict(b: Battle) -> dict:
         "losses": json.loads(b.losses_json or "{}"),
         "rewards": json.loads(b.rewards_json or "{}"),
         "battle_log": b.battle_log,
+    }
+
+
+def _character_to_dict(c: Character) -> dict:
+    return {
+        "id": c.id,
+        "world_id": c.world_id,
+        "sect_id": c.sect_id,
+        "name": c.name,
+        "role": c.role,
+        "realm": c.realm,
+        "cultivation": c.cultivation,
+        "talent": c.talent,
+        "loyalty": c.loyalty,
+        "ambition": c.ambition,
+        "combat_power": c.combat_power,
+        "luck": c.luck,
+        "status": c.status,
+        "traits": json.loads(c.traits_json or "[]"),
+        "relationships": json.loads(c.relationships_json or "{}"),
+        "inventory": json.loads(c.inventory_json or "[]"),
+        "story_flags": json.loads(c.story_flags_json or "[]"),
+        "created_at": c.created_at.isoformat() if c.created_at else "",
+        "updated_at": c.updated_at.isoformat() if c.updated_at else "",
+    }
+
+
+def _proposal_to_dict(p: DiplomacyProposal) -> dict:
+    return {
+        "id": p.id,
+        "world_id": p.world_id,
+        "turn": p.turn,
+        "from_sect_id": p.from_sect_id,
+        "from_sect_name": p.from_sect_name,
+        "to_sect_id": p.to_sect_id,
+        "to_sect_name": p.to_sect_name,
+        "proposal_type": p.proposal_type,
+        "title": p.title,
+        "description": p.description,
+        "conditions": json.loads(p.conditions_json or "{}"),
+        "status": p.status,
+        "response_message": p.response_message,
+        "response_turn": p.response_turn,
+        "is_secret": p.is_secret,
+        "betrayed_by": p.betrayed_by,
+        "betrayal_turn": p.betrayal_turn,
+        "betrayal_reason": p.betrayal_reason,
+        "success_rate": p.success_rate,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
     }
 
 
