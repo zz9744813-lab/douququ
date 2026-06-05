@@ -14,8 +14,10 @@ type WorldStore = {
 
   setCurrentWorld: (world: World | null) => void;
   loadWorld: (worldId: string) => Promise<void>;
-  advanceTurn: (worldId: string) => Promise<TurnResult | null>;
-  autoRun: (worldId: string, turns: number) => Promise<void>;
+  useLlm: boolean;
+  setUseLlm: (value: boolean) => void;
+  advanceTurn: (worldId: string, use_llm?: boolean) => Promise<TurnResult | null>;
+  autoRun: (worldId: string, turns: number, use_llm?: boolean) => Promise<void>;
   refreshData: () => Promise<void>;
   clear: () => void;
 };
@@ -29,8 +31,10 @@ export const useWorldStore = create<WorldStore>((set, get) => ({
   battles: [],
   loading: false,
   error: null,
+  useLlm: false,
 
   setCurrentWorld: (world) => set({ currentWorld: world }),
+  setUseLlm: (value) => set({ useLlm: value }),
 
   loadWorld: async (worldId) => {
     set({ loading: true, error: null });
@@ -55,11 +59,11 @@ export const useWorldStore = create<WorldStore>((set, get) => ({
     }
   },
 
-  advanceTurn: async (worldId) => {
+  advanceTurn: async (worldId, use_llm) => {
     set({ loading: true, error: null });
     try {
-      const result = await api.advanceTurn(worldId);
-      // Refresh data after advance
+      const llm = use_llm ?? get().useLlm;
+      const result = await api.advanceTurn(worldId, llm);
       await get().loadWorld(worldId);
       return result;
     } catch (e) {
@@ -68,10 +72,11 @@ export const useWorldStore = create<WorldStore>((set, get) => ({
     }
   },
 
-  autoRun: async (worldId, turns) => {
+  autoRun: async (worldId, turns, use_llm) => {
     set({ loading: true, error: null });
     try {
-      await api.autoRun(worldId, turns);
+      const llm = use_llm ?? get().useLlm;
+      await api.autoRun(worldId, turns, llm);
       await get().loadWorld(worldId);
     } catch (e) {
       set({ error: (e as Error).message, loading: false });
