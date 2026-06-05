@@ -29,7 +29,8 @@ export default function WorldMap({ mapData, regions, sects, selectedSectId, onSe
     const chart = instanceRef.current;
 
     const sectMap = new Map(mapData.sects.map((s) => [s.id, s]));
-    const regionMap = new Map(regions.map((r) => [r.id, r]));
+    // regionMap available for future use
+    void regions;
 
     // Create nodes
     const nodes = mapData.nodes.map((n, i) => {
