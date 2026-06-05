@@ -21,24 +21,24 @@ class TurnResult(BaseModel):
 
 
 @router.post("/{world_id}/turns/next", response_model=TurnResult)
-def advance_turn(world_id: str, db: Session = Depends(get_db)):
-    """推进一个回合"""
+async def advance_turn(world_id: str, use_llm: bool = False, db: Session = Depends(get_db)):
+    """推进一个回合（支持 LLM Agent）"""
     world = db.query(World).filter(World.id == world_id).first()
     if not world:
         raise HTTPException(status_code=404, detail="世界不存在")
     if world.status == "finished":
         raise HTTPException(status_code=400, detail="世界已结束")
 
-    engine = SimulationEngine(db)
-    result = engine.run_turn(world_id)
+    engine = SimulationEngine(db, use_llm=use_llm)
+    result = await engine.run_turn(world_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
 
 @router.post("/{world_id}/turns/auto-run")
-def auto_run(world_id: str, turns: int = 10, db: Session = Depends(get_db)):
-    """自动运行多个回合"""
+async def auto_run(world_id: str, turns: int = 10, use_llm: bool = False, db: Session = Depends(get_db)):
+    """自动运行多个回合（支持 LLM Agent）"""
     world = db.query(World).filter(World.id == world_id).first()
     if not world:
         raise HTTPException(status_code=404, detail="世界不存在")
@@ -46,11 +46,11 @@ def auto_run(world_id: str, turns: int = 10, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="世界已结束")
 
     results = []
-    engine = SimulationEngine(db)
+    engine = SimulationEngine(db, use_llm=use_llm)
     for _ in range(min(turns, 50)):
         if world.status == "finished":
             break
-        result = engine.run_turn(world_id)
+        result = await engine.run_turn(world_id)
         if "error" in result:
             break
         results.append(result)
