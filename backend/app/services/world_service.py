@@ -14,6 +14,7 @@ from app.models.diplomacy import DiplomacyRelation
 from app.models.turn import TurnRecord
 from app.models.event import WorldEvent
 from app.models.battle import Battle
+from app.services.map_engine import MapEngine
 
 
 SECT_TEMPLATES = {
@@ -104,11 +105,27 @@ class WorldService:
         db.add(world)
         db.flush()
 
-        # 生成地图区域
+        # 生成连通地图区域
         region_count = {"small": 12, "medium": 20, "large": 30}.get(map_size, 20)
-        regions = WorldService._generate_regions(world.id, region_count, world_seed)
-        for r in regions:
-            db.add(r)
+        map_nodes = MapEngine.generate_connected_map(world.id, region_count, world_seed)
+        regions = []
+        for node in map_nodes:
+            region = Region(
+                id=node["id"],
+                world_id=node["world_id"],
+                name=node["name"],
+                region_type=node["region_type"],
+                owner_sect_id=node["owner_sect_id"],
+                resource_level=node["resource_level"],
+                defense_level=node["defense_level"],
+                stability=node["stability"],
+                pos_x=node["pos_x"],
+                pos_y=node["pos_y"],
+                neighbors_json=json.dumps(node["neighbors"], ensure_ascii=False),
+                special_flags_json=json.dumps(node["special_flags"], ensure_ascii=False),
+            )
+            db.add(region)
+            regions.append(region)
         db.flush()
 
         # 生成宗门
@@ -137,8 +154,16 @@ class WorldService:
             sects.append(sect)
         db.flush()
 
-        # 分配宗门初始地盘
-        WorldService._assign_initial_regions(sects, regions, db)
+        # 使用 MapEngine 分配宗门初始地盘（尽量分散）
+        assignments = MapEngine.assign_spawn_points(map_nodes, len(sects), world_seed)
+        for i, sect in enumerate(sects):
+            assigned_ids = assignments[i] if i < len(assignments) else []
+            for rid in assigned_ids:
+                for r in regions:
+                    if r.id == rid:
+                        r.owner_sect_id = sect.id
+                        break
+            sect.controlled_regions_json = json.dumps(assigned_ids, ensure_ascii=False)
 
         # 初始化外交关系
         WorldService._init_diplomacy(world.id, sects, db)
