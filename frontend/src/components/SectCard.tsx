@@ -8,12 +8,12 @@ const SECT_COLORS: Record<string, string> = {
 
 interface Props {
   sect: Sect;
-  regions: Region[];
+  regions?: Region[];
   isSelected: boolean;
   onClick: () => void;
 }
 
-export default function SectCard({ sect, regions, isSelected, onClick }: Props) {
+export default function SectCard({ sect, isSelected, onClick }: Props) {
   const color = SECT_COLORS[sect.sect_type] || '#888';
   const regionCount = sect.controlled_regions.length;
   const military = sect.stats.military_power || 0;
