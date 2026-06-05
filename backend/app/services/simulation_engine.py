@@ -19,24 +19,29 @@ from app.models.event import WorldEvent
 from app.models.battle import Battle
 from app.services.rule_engine import RuleEngine
 from app.services.battle_engine import BattleEngine
+from app.services.battle_replay_engine import BattleReplayEngine
 from app.services.diplomacy_engine import DiplomacyEngine
 from app.services.event_engine import EventEngine
 from app.services.default_ai import DefaultAI
+from app.services.llm_agent import LLMAgent
 
 
 class SimulationEngine:
     """回合模拟引擎"""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, use_llm: bool = False):
         self.db = db
         self.rule_engine = RuleEngine()
         self.battle_engine = BattleEngine()
+        self.battle_replay_engine = BattleReplayEngine()
         self.diplomacy_engine = DiplomacyEngine()
         self.event_engine = EventEngine()
         self.default_ai = DefaultAI()
+        self.llm_agent = LLMAgent() if use_llm else None
+        self.use_llm = use_llm
 
-    def run_turn(self, world_id: str) -> dict:
-        """执行一个完整回合"""
+    async def run_turn(self, world_id: str) -> dict:
+        """执行一个完整回合（支持异步 LLM Agent）"""
         world = self.db.query(World).filter(World.id == world_id).first()
         if not world:
             return {"error": "世界不存在"}
@@ -53,6 +58,7 @@ class SimulationEngine:
         diplomacy = self.db.query(DiplomacyRelation).filter(DiplomacyRelation.world_id == world_id).all()
 
         world_state = self._build_world_state(sects, regions, diplomacy)
+        world_state["turn"] = turn
 
         # 2. 生成世界事件
         world_events = self.event_engine.generate_world_events(turn, world.world_seed)
@@ -60,13 +66,32 @@ class SimulationEngine:
         # 3. 保存回合快照
         input_snapshot = self._build_snapshot(sects, regions, diplomacy)
 
-        # 4. 各宗门生成行动
+        # 4. 各宗门生成行动（支持 LLM Agent 异步并行）
         all_actions = {}
-        for sect in sects:
-            sect_state = self._build_sect_state(sect, regions, world_state)
-            # 使用默认AI生成行动
-            ai_output = self.default_ai.generate_actions(sect_state, world_state, max_actions=3)
-            all_actions[sect.id] = ai_output
+        if self.use_llm and self.llm_agent:
+            # 并行调用 LLM Agent
+            import asyncio
+            tasks = []
+            for sect in sects:
+                sect_state = self._build_sect_state(sect, regions, world_state)
+                tasks.append(self.llm_agent.generate_actions(sect_state, world_state, max_actions=3))
+            llm_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for sect, result in zip(sects, llm_results):
+                if isinstance(result, Exception):
+                    # LLM 异常，回退到默认 AI
+                    ai_output = self.default_ai.generate_actions(
+                        self._build_sect_state(sect, regions, world_state), world_state, max_actions=3
+                    )
+                    ai_output["source"] = "fallback_exception"
+                    ai_output["llm_error"] = str(result)
+                    all_actions[sect.id] = ai_output
+                else:
+                    all_actions[sect.id] = result
+        else:
+            for sect in sects:
+                sect_state = self._build_sect_state(sect, regions, world_state)
+                ai_output = self.default_ai.generate_actions(sect_state, world_state, max_actions=3)
+                all_actions[sect.id] = ai_output
 
         # 5. 收集并分类行动
         war_actions = []
@@ -105,6 +130,8 @@ class SimulationEngine:
                 # 消耗行动点
                 cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
                 sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
+                # 统一扣除资源
+                self.rule_engine.deduct_cost(sect, action.get("type", ""))
                 result = self.rule_engine.resolve_action(action, sect, world_state)
                 self.rule_engine.apply_effects(sect["resources"], sect["stats"], result.get("effects", {}))
                 all_results.append({"sect_id": sect_id, "action": action, "result": result, "valid": True})
@@ -124,6 +151,8 @@ class SimulationEngine:
             # 消耗行动点
             cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
             sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
+            # 统一扣除资源
+            self.rule_engine.deduct_cost(sect, action.get("type", ""))
 
             target_id = action.get("target_sect_id")
             target = sect_states.get(target_id)
@@ -179,8 +208,8 @@ class SimulationEngine:
             if not target:
                 continue
 
-            # 消耗资源
-            sect["resources"]["spirit_stones"] = max(0, sect["resources"].get("spirit_stones", 0) - 200)
+            # 统一扣除资源
+            self.rule_engine.deduct_cost(sect, "declare_war")
 
             # 结算战争
             region_id = action.get("target_region_id")
@@ -210,6 +239,12 @@ class SimulationEngine:
             if rel:
                 rel.relation_type = "war"
                 rel.relation_score = min(rel.relation_score, -0.5)
+
+            # 生成战斗回放
+            replay = self.battle_replay_engine.generate_replay(
+                sect, target, region, battle_result
+            )
+            battle_result["replay"] = replay
 
             # 保存战争记录
             battle = Battle(
@@ -241,6 +276,8 @@ class SimulationEngine:
                 # 消耗行动点
                 cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
                 sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
+                # 统一扣除资源
+                self.rule_engine.deduct_cost(sect, action.get("type", ""))
                 result = self.rule_engine.resolve_action(action, sect, world_state)
                 self.rule_engine.apply_effects(sect["resources"], sect["stats"], result.get("effects", {}))
                 all_results.append({"sect_id": sect_id, "action": action, "result": result, "valid": True})
@@ -251,6 +288,8 @@ class SimulationEngine:
         for sect_id, sect in sect_states.items():
             sect_events = self.event_engine.generate_sect_events(sect, turn, world.world_seed)
             for evt in sect_events:
+                # 应用事件效果到世界状态
+                self.event_engine.apply_event_effects(evt, sect_states)
                 we = WorldEvent(
                     id=uuid.uuid4().hex[:12],
                     world_id=world_id,
@@ -268,6 +307,8 @@ class SimulationEngine:
 
         # 7b. 世界事件
         for evt in world_events:
+            # 应用世界事件效果
+            self.event_engine.apply_event_effects(evt, sect_states)
             we = WorldEvent(
                 id=uuid.uuid4().hex[:12],
                 world_id=world_id,
