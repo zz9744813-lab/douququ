@@ -1,33 +1,31 @@
 """
-Simulation Engine - 回合模拟引擎
-负责每个回合的完整流程：AI决策 → 规则校验 → 结算 → 战报生成
+Simulation Engine - 核心模拟引擎
+整合规则、战斗、外交、事件、角色、LLM Agent
 """
 import json
 import random
-import uuid
 from typing import Any
-from datetime import datetime, timezone
-
 from sqlalchemy.orm import Session
 
 from app.models.world import World
 from app.models.sect import Sect
 from app.models.region import Region
-from app.models.diplomacy import DiplomacyRelation
-from app.models.turn import TurnRecord
 from app.models.event import WorldEvent
+from app.models.turn import TurnRecord
 from app.models.battle import Battle
+from app.models.character import Character
 from app.services.rule_engine import RuleEngine
 from app.services.battle_engine import BattleEngine
 from app.services.battle_replay_engine import BattleReplayEngine
 from app.services.diplomacy_engine import DiplomacyEngine
 from app.services.event_engine import EventEngine
 from app.services.default_ai import DefaultAI
-from app.services.llm_agent import LLMAgent
+from app.services.llm_router import LLMRouter
+from app.services.character_engine import CharacterEngine
 
 
 class SimulationEngine:
-    """回合模拟引擎"""
+    """核心模拟引擎"""
 
     def __init__(self, db: Session, use_llm: bool = False):
         self.db = db
@@ -37,44 +35,87 @@ class SimulationEngine:
         self.diplomacy_engine = DiplomacyEngine()
         self.event_engine = EventEngine()
         self.default_ai = DefaultAI()
-        self.llm_agent = LLMAgent() if use_llm else None
+        self.llm_router = LLMRouter(db) if use_llm else None
         self.use_llm = use_llm
+        self.character_engine = CharacterEngine()
 
     async def run_turn(self, world_id: str) -> dict:
-        """执行一个完整回合（支持异步 LLM Agent）"""
+        """运行一个完整回合"""
         world = self.db.query(World).filter(World.id == world_id).first()
         if not world:
-            return {"error": "世界不存在"}
-        if world.status == "finished":
-            return {"error": "世界已结束"}
+            return {"error": "World not found"}
 
         turn = world.current_turn + 1
-        world.status = "running"
-        self.db.flush()
+        if world.max_turns and turn > world.max_turns:
+            world.status = "finished"
+            self.db.commit()
+            return {"error": "World has reached max turns"}
 
-        # 1. 加载世界状态
+        # 加载世界状态
         sects = self.db.query(Sect).filter(Sect.world_id == world_id, Sect.status == "active").all()
         regions = self.db.query(Region).filter(Region.world_id == world_id).all()
-        diplomacy = self.db.query(DiplomacyRelation).filter(DiplomacyRelation.world_id == world_id).all()
+        diplomacy = world.diplomacy_relations
 
-        world_state = self._build_world_state(sects, regions, diplomacy)
-        world_state["turn"] = turn
+        # 构建世界状态快照
+        world_state = self._build_world_state(sects, regions, diplomacy, turn)
 
-        # 2. 生成世界事件
-        world_events = self.event_engine.generate_world_events(turn, world.world_seed)
+        # 1. 生成世界事件
+        events = self.event_engine.generate_events(world_state, turn)
 
-        # 3. 保存回合快照
-        input_snapshot = self._build_snapshot(sects, regions, diplomacy)
+        # 2. 处理世界事件效果
+        for event in events:
+            effects = event.get("effects", {})
+            for sect_id, effect in effects.items():
+                sect = next((s for s in sects if s.id == sect_id), None)
+                if sect:
+                    self._apply_event_effect(sect, effect)
 
-        # 4. 各宗门生成行动（支持 LLM Agent 异步并行）
+            # 保存事件
+            world_event = WorldEvent(
+                world_id=world_id,
+                turn=turn,
+                event_type=event["type"],
+                title=event["title"],
+                description=event["description"],
+                severity=event.get("severity", 0.5),
+                affected_sects_json=json.dumps(event.get("affected_sects", [])),
+                effects_json=json.dumps(event.get("effects", {})),
+            )
+            self.db.add(world_event)
+
+        # 3. 外交阶段
+        diplomacy_results = []
+        for rel in diplomacy:
+            if rel.relation_type in ("alliance", "trade"):
+                result = self.diplomacy_engine.process_diplomacy(rel, world_state)
+                if result:
+                    diplomacy_results.append(result)
+                    # 更新关系
+                    rel.relation_score = max(-1, min(1, rel.relation_score + result.get("score_change", 0)))
+                    history = json.loads(rel.history_json or "[]")
+                    history.append({
+                        "turn": turn,
+                        "action": result.get("action", "unknown"),
+                        "success": result.get("success", False),
+                        "score_change": result.get("score_change", 0),
+                    })
+                    rel.history_json = json.dumps(history)
+
+        # 4. 各宗门生成行动（支持 LLM Router 异步并行）
         all_actions = {}
-        if self.use_llm and self.llm_agent:
-            # 并行调用 LLM Agent
+        if self.use_llm and self.llm_router:
+            # 并行调用 LLM Router
             import asyncio
             tasks = []
             for sect in sects:
                 sect_state = self._build_sect_state(sect, regions, world_state)
-                tasks.append(self.llm_agent.generate_actions(sect_state, world_state, max_actions=3))
+                messages = self._build_agent_messages(sect_state, world_state)
+                tasks.append(self.llm_router.run_agent(
+                    world_id=world_id,
+                    sect_id=sect.id,
+                    agent_role="sect_master",
+                    messages=messages,
+                ))
             llm_results = await asyncio.gather(*tasks, return_exceptions=True)
             for sect, result in zip(sects, llm_results):
                 if isinstance(result, Exception):
@@ -85,367 +126,434 @@ class SimulationEngine:
                     ai_output["source"] = "fallback_exception"
                     ai_output["llm_error"] = str(result)
                     all_actions[sect.id] = ai_output
+                elif isinstance(result, dict) and result.get("fallback"):
+                    # LLMRouter 返回 fallback（所有模型都失败）
+                    ai_output = self.default_ai.generate_actions(
+                        self._build_sect_state(sect, regions, world_state), world_state, max_actions=3
+                    )
+                    ai_output["source"] = "fallback_no_model"
+                    ai_output["llm_error"] = result.get("last_error", "无可用模型")
+                    all_actions[sect.id] = ai_output
                 else:
-                    all_actions[sect.id] = result
+                    # LLM 成功返回，解析为行动格式
+                    ai_output = self._parse_llm_output(result, sect)
+                    ai_output["source"] = "llm"
+                    all_actions[sect.id] = ai_output
         else:
             for sect in sects:
                 sect_state = self._build_sect_state(sect, regions, world_state)
                 ai_output = self.default_ai.generate_actions(sect_state, world_state, max_actions=3)
                 all_actions[sect.id] = ai_output
 
-        # 5. 收集并分类行动
-        war_actions = []
-        diplomacy_actions = []
-        economy_actions = []
-        other_actions = []
+        # 5. 执行行动
+        results = []
+        for sect in sects:
+            actions = all_actions.get(sect.id, {}).get("actions", [])
+            action_points = 3
+            for action in actions:
+                if action_points <= 0:
+                    break
+                cost = self.rule_engine.get_action_cost(action["type"])
+                if action_points >= cost:
+                    action_points -= cost
+                    result = self._execute_action(sect, action, world_state, regions, diplomacy, turn)
+                    if result:
+                        results.append(result)
 
-        for sect_id, ai_output in all_actions.items():
-            for action in ai_output["actions"]:
-                atype = action.get("type", "")
-                entry = (sect_id, action)
-                if atype == "declare_war":
-                    war_actions.append(entry)
-                elif atype == "diplomacy_offer":
-                    diplomacy_actions.append(entry)
-                elif atype in ("build_structure", "make_pills", "craft_artifacts"):
-                    economy_actions.append(entry)
-                else:
-                    other_actions.append(entry)
-
-        # 6. 按顺序结算：经济 → 外交 → 战争 → 其他
-        all_results = []
-        sect_states = {s.id: self._load_sect_dict(s) for s in sects}
-        # 每个宗门每回合有 3 个行动点
-        for sid in sect_states:
-            sect_states[sid]["action_points"] = 3
-        region_states = {r.id: self._load_region_dict(r) for r in regions}
-
-        # 6a. 经济行动
-        for sect_id, action in economy_actions:
-            sect = sect_states.get(sect_id)
-            if not sect:
-                continue
-            is_valid, reason = self.rule_engine.validate_action(action, sect, world_state)
-            if is_valid:
-                # 消耗行动点
-                cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
-                sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
-                # 统一扣除资源
-                self.rule_engine.deduct_cost(sect, action.get("type", ""))
-                result = self.rule_engine.resolve_action(action, sect, world_state)
-                self.rule_engine.apply_effects(sect["resources"], sect["stats"], result.get("effects", {}))
-                all_results.append({"sect_id": sect_id, "action": action, "result": result, "valid": True})
-            else:
-                all_results.append({"sect_id": sect_id, "action": action, "result": {"log": reason}, "valid": False})
-
-        # 6b. 外交行动
-        for sect_id, action in diplomacy_actions:
-            sect = sect_states.get(sect_id)
-            if not sect:
-                continue
-            is_valid, reason = self.rule_engine.validate_action(action, sect, world_state)
-            if not is_valid:
-                all_results.append({"sect_id": sect_id, "action": action, "result": {"log": reason}, "valid": False})
-                continue
-
-            # 消耗行动点
-            cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
-            sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
-            # 统一扣除资源
-            self.rule_engine.deduct_cost(sect, action.get("type", ""))
-
-            target_id = action.get("target_sect_id")
-            target = sect_states.get(target_id)
-            if not target:
-                all_results.append({"sect_id": sect_id, "action": action, "result": {"log": "目标宗门不存在"}, "valid": False})
-                continue
-
-            # 找到外交关系
-            rel = self._find_diplomacy_relation(diplomacy, sect_id, target_id)
-            rel_state = self._load_relation_dict(rel) if rel else {"relation_type": "neutral", "relation_score": 0, "trust_score": 0.5}
-
-            dip_result = self.diplomacy_engine.resolve_diplomacy(
-                action.get("offer_type", "trade"),
-                sect, target, rel_state, world_state,
-            )
-            # 更新外交关系
-            if rel:
-                rel.relation_score = min(1.0, max(-1.0, rel.relation_score + dip_result["relation_change"]))
-                rel.relation_type = dip_result["new_relation_type"]
-                rel.trust_score = min(1.0, max(0.0, rel.trust_score + (0.05 if dip_result["success"] else -0.05)))
-                history = json.loads(rel.history_json or "[]")
-                history.append({"turn": turn, "action": action.get("offer_type"), "success": dip_result["success"]})
-                if len(history) > 20:
-                    history = history[-20:]
-                rel.history_json = json.dumps(history, ensure_ascii=False)
-
-            all_results.append({"sect_id": sect_id, "action": action, "result": dip_result, "valid": True})
-
-        # 6c. 资源产出
-        for sect_id, sect in sect_states.items():
-            owned_regions = [region_states.get(rid) for rid in sect.get("controlled_regions", [])]
-            owned_regions = [r for r in owned_regions if r]
-            production = self.rule_engine.calculate_resource_production(sect, owned_regions)
-            for k, v in production.items():
-                sect["resources"][k] = sect["resources"].get(k, 0) + v
-
-        # 6d. 战争行动
-        for sect_id, action in war_actions:
-            sect = sect_states.get(sect_id)
-            if not sect:
-                continue
-            is_valid, reason = self.rule_engine.validate_action(action, sect, world_state)
-            if not is_valid:
-                all_results.append({"sect_id": sect_id, "action": action, "result": {"log": reason}, "valid": False})
-                continue
-
-            # 消耗行动点
-            cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 2)
-            sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
-
-            target_id = action.get("target_sect_id")
-            target = sect_states.get(target_id)
-            if not target:
-                continue
-
-            # 统一扣除资源
-            self.rule_engine.deduct_cost(sect, "declare_war")
-
-            # 结算战争
-            region_id = action.get("target_region_id")
-            region = region_states.get(region_id) if region_id else None
-            battle_result = self.battle_engine.resolve_battle(sect, target, region)
-
-            # 应用伤亡
-            sect["stats"]["military_power"] = max(0, sect["stats"].get("military_power", 0) - battle_result["losses"]["attacker_loss"])
-            target["stats"]["military_power"] = max(0, target["stats"].get("military_power", 0) - battle_result["losses"]["defender_loss"])
-
-            # 处理奖励
-            rewards = battle_result["rewards"]
-            if rewards.get("spirit_stones", 0) > 0:
-                sect["resources"]["spirit_stones"] = sect["resources"].get("spirit_stones", 0) + rewards["spirit_stones"]
-                target["resources"]["spirit_stones"] = max(0, target["resources"].get("spirit_stones", 0) - rewards["spirit_stones"])
-
-            # 占领区域
-            for rid in rewards.get("regions_captured", []):
-                if rid in region_states:
-                    region_states[rid]["owner_sect_id"] = sect_id
-                    sect["controlled_regions"].append(rid)
-                    if rid in target.get("controlled_regions", []):
-                        target["controlled_regions"].remove(rid)
-
-            # 更新外交关系
-            rel = self._find_diplomacy_relation(diplomacy, sect_id, target_id)
-            if rel:
-                rel.relation_type = "war"
-                rel.relation_score = min(rel.relation_score, -0.5)
-
-            # 生成战斗回放
-            replay = self.battle_replay_engine.generate_replay(
-                sect, target, region, battle_result
-            )
-            battle_result["replay"] = replay
-
-            # 保存战争记录
-            battle = Battle(
-                id=uuid.uuid4().hex[:12],
-                world_id=world_id,
-                turn=turn,
-                attacker_sect_id=sect_id,
-                defender_sect_id=target_id,
-                region_id=region_id,
-                result_type=battle_result["result_type"],
-                winner_sect_id=battle_result["winner_sect_id"],
-                attacker_power=battle_result["attacker_power"],
-                defender_power=battle_result["defender_power"],
-                losses_json=json.dumps(battle_result["losses"], ensure_ascii=False),
-                rewards_json=json.dumps(rewards, ensure_ascii=False),
-                battle_log=battle_result["battle_log"],
-            )
-            self.db.add(battle)
-
-            all_results.append({"sect_id": sect_id, "action": action, "result": battle_result, "valid": True})
-
-        # 6e. 其他行动
-        for sect_id, action in other_actions:
-            sect = sect_states.get(sect_id)
-            if not sect:
-                continue
-            is_valid, reason = self.rule_engine.validate_action(action, sect, world_state)
-            if is_valid:
-                # 消耗行动点
-                cost = self.rule_engine.ACTION_COSTS.get(action.get("type", ""), 1)
-                sect["action_points"] = max(0, sect.get("action_points", 0) - cost)
-                # 统一扣除资源
-                self.rule_engine.deduct_cost(sect, action.get("type", ""))
-                result = self.rule_engine.resolve_action(action, sect, world_state)
-                self.rule_engine.apply_effects(sect["resources"], sect["stats"], result.get("effects", {}))
-                all_results.append({"sect_id": sect_id, "action": action, "result": result, "valid": True})
-            else:
-                all_results.append({"sect_id": sect_id, "action": action, "result": {"log": reason}, "valid": False})
-
-        # 7. 宗门事件
-        for sect_id, sect in sect_states.items():
-            sect_events = self.event_engine.generate_sect_events(sect, turn, world.world_seed)
-            for evt in sect_events:
-                # 应用事件效果到世界状态
-                self.event_engine.apply_event_effects(evt, sect_states)
-                we = WorldEvent(
-                    id=uuid.uuid4().hex[:12],
+        # 6. 角色日常事件
+        for sect in sects:
+            chars = self._get_sect_characters(sect.id)
+            rng = random.Random(world.world_seed + turn + hash(sect.id))
+            char_events = self.character_engine.generate_character_events(chars, turn, rng)
+            for evt in char_events:
+                world_event = WorldEvent(
                     world_id=world_id,
                     turn=turn,
-                    event_type=evt["type"],
+                    event_type=evt["event_type"],
                     title=evt["title"],
                     description=evt["description"],
-                    severity=evt["severity"],
-                    affected_sects_json=json.dumps(evt.get("affected_sects", []), ensure_ascii=False),
-                    affected_regions_json=json.dumps([], ensure_ascii=False),
-                    tags_json=json.dumps([], ensure_ascii=False),
-                    raw_result_json=json.dumps(evt, ensure_ascii=False),
+                    severity=0.6,
+                    affected_sects_json=json.dumps([sect.id]),
                 )
-                self.db.add(we)
+                self.db.add(world_event)
 
-        # 7b. 世界事件
-        for evt in world_events:
-            # 应用世界事件效果
-            self.event_engine.apply_event_effects(evt, sect_states)
-            we = WorldEvent(
-                id=uuid.uuid4().hex[:12],
-                world_id=world_id,
-                turn=turn,
-                event_type=evt["type"],
-                title=evt["title"],
-                description=evt["description"],
-                severity=evt["severity"],
-                affected_sects_json=json.dumps(evt.get("affected_sects", []), ensure_ascii=False),
-                affected_regions_json=json.dumps(evt.get("affected_regions", []), ensure_ascii=False),
-                tags_json=json.dumps([], ensure_ascii=False),
-                raw_result_json=json.dumps(evt, ensure_ascii=False),
-            )
-            self.db.add(we)
+        # 7. 结算和更新
+        for sect in sects:
+            # 资源自然增长
+            resources = json.loads(sect.resources_json or "{}")
+            resources["spirit_stones"] = resources.get("spirit_stones", 0) + random.randint(5, 15)
+            resources["herbs"] = resources.get("herbs", 0) + random.randint(2, 8)
+            resources["ores"] = resources.get("ores", 0) + random.randint(2, 8)
+            sect.resources_json = json.dumps(resources)
 
-        # 8. 吞并检查
-        self._check_annexation(sect_states, diplomacy, turn, world_id)
+            # 稳定性恢复
+            stats = json.loads(sect.stats_json or "{}")
+            stats["stability"] = min(1.0, stats.get("stability", 0.5) + 0.02)
+            sect.stats_json = json.dumps(stats)
 
-        # 9. 保存宗门状态
-        for s in sects:
-            if s.id in sect_states:
-                st = sect_states[s.id]
-                s.status = st.get("status", s.status)
-                s.resources_json = json.dumps(st["resources"], ensure_ascii=False)
-                s.stats_json = json.dumps(st["stats"], ensure_ascii=False)
-                s.controlled_regions_json = json.dumps(st["controlled_regions"], ensure_ascii=False)
-                s.strategy_summary = all_actions.get(s.id, {}).get("strategy_summary", "")
-                # 更新记忆
-                memory = json.loads(s.memory_json or "[]")
-                for r in all_results:
-                    if r["sect_id"] == s.id and r["valid"]:
-                        memory.append({
-                            "turn": turn,
-                            "action": r["action"].get("type"),
-                            "result": r["result"].get("log", ""),
-                            "importance": 0.5,
-                        })
-                if len(memory) > 30:
-                    memory = memory[-30:]
-                s.memory_json = json.dumps(memory, ensure_ascii=False)
+        # 8. 检查宗门吞并
+        for sect in sects:
+            stats = json.loads(sect.stats_json or "{}")
+            if stats.get("stability", 1) <= 0.1 or stats.get("military_power", 50) <= 0:
+                sect.status = "annexed"
+                # 触发吞并事件
+                world_event = WorldEvent(
+                    world_id=world_id,
+                    turn=turn,
+                    event_type="annexation",
+                    title=f"{sect.name} 被吞并",
+                    description=f"{sect.name} 因内忧外患，最终走向灭亡。",
+                    severity=1.0,
+                    affected_sects_json=json.dumps([sect.id]),
+                )
+                self.db.add(world_event)
 
-        # 10. 保存区域状态
-        for r in regions:
-            if r.id in region_states:
-                r.owner_sect_id = region_states[r.id].get("owner_sect_id")
-
-        # 11. 保存回合记录
+        # 9. 保存回合记录
+        summary = self._generate_turn_summary(results, events, turn)
         turn_record = TurnRecord(
-            id=uuid.uuid4().hex[:12],
             world_id=world_id,
             turn=turn,
-            status="completed",
-            input_snapshot_json=json.dumps(input_snapshot, ensure_ascii=False),
-            agent_actions_json=json.dumps(all_actions, ensure_ascii=False, default=str),
-            resolved_results_json=json.dumps(all_results, ensure_ascii=False, default=str),
-            summary=self._generate_turn_summary(all_results, world_events, turn),
+            summary=summary,
+            events_json=json.dumps(events, ensure_ascii=False),
+            actions_json=json.dumps(all_actions, ensure_ascii=False, default=str),
         )
         self.db.add(turn_record)
 
-        # 12. 更新世界状态
         world.current_turn = turn
-        world.updated_at = datetime.now(timezone.utc)
-
-        # 检查结束条件
-        active_sects = [s for s in sect_states.values() if s.get("status") == "active"]
-        if len(active_sects) <= 1:
-            world.status = "finished"
-        elif world.max_turns and turn >= world.max_turns:
+        if world.max_turns and world.current_turn >= world.max_turns:
             world.status = "finished"
 
         self.db.commit()
 
         return {
             "turn": turn,
+            "summary": summary,
+            "events": events,
+            "results": results,
             "world_status": world.status,
-            "actions_count": len(all_actions),
-            "results_count": len(all_results),
-            "events_count": len(world_events),
-            "summary": turn_record.summary,
         }
 
-    def _build_world_state(self, sects: list, regions: list, diplomacy: list) -> dict:
+    def _build_world_state(self, sects: list, regions: list, diplomacy: list, turn: int) -> dict:
+        """构建世界状态快照"""
         return {
-            "sects": [self._load_sect_dict(s) for s in sects],
-            "regions": [self._load_region_dict(r) for r in regions],
-            "diplomacy": [self._load_relation_dict(r) for r in diplomacy],
+            "turn": turn,
+            "sects": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "sect_type": s.sect_type,
+                    "status": s.status,
+                    "resources": json.loads(s.resources_json or "{}"),
+                    "stats": json.loads(s.stats_json or "{}"),
+                    "controlled_regions": json.loads(s.controlled_regions_json or "[]"),
+                    "leader_name": s.leader_name,
+                    "model_name": s.model_name,
+                }
+                for s in sects
+            ],
+            "regions": [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    "region_type": r.region_type,
+                    "owner_sect_id": r.owner_sect_id,
+                    "resources": json.loads(r.resources_json or "{}"),
+                    "position": json.loads(r.position_json or "{}"),
+                }
+                for r in regions
+            ],
+            "diplomacy": [
+                {
+                    "sect_a_id": d.sect_a_id,
+                    "sect_b_id": d.sect_b_id,
+                    "relation_type": d.relation_type,
+                    "relation_score": d.relation_score,
+                }
+                for d in diplomacy
+            ],
         }
 
     def _build_sect_state(self, sect: Sect, regions: list, world_state: dict) -> dict:
-        state = self._load_sect_dict(sect)
-        state["action_points"] = 3
-        state["active_treaties"] = []
-        return state
-
-    def _build_snapshot(self, sects: list, regions: list, diplomacy: list) -> dict:
-        return {
-            "sects": [self._load_sect_dict(s) for s in sects],
-            "regions": [self._load_region_dict(r) for r in regions],
-            "diplomacy": [self._load_relation_dict(r) for r in diplomacy],
-        }
-
-    def _load_sect_dict(self, sect: Sect) -> dict:
+        """构建单个宗门状态"""
         return {
             "id": sect.id,
             "name": sect.name,
             "sect_type": sect.sect_type,
-            "status": sect.status,
             "resources": json.loads(sect.resources_json or "{}"),
             "stats": json.loads(sect.stats_json or "{}"),
-            "personality": json.loads(sect.personality_json or "{}"),
             "controlled_regions": json.loads(sect.controlled_regions_json or "[]"),
-            "enemy_sects": [],
+            "leader_name": sect.leader_name,
+            "model_name": sect.model_name,
+            "personality": sect.personality,
+            "neighbors": self._get_neighbors(sect, regions),
         }
 
-    def _load_region_dict(self, region: Region) -> dict:
+    def _get_neighbors(self, sect: Sect, regions: list) -> list:
+        """获取相邻宗门"""
+        controlled = json.loads(sect.controlled_regions_json or "[]")
+        neighbor_ids = set()
+        for region in regions:
+            if region.id in controlled:
+                adj = json.loads(region.adjacent_regions_json or "[]")
+                for adj_id in adj:
+                    adj_region = next((r for r in regions if r.id == adj_id), None)
+                    if adj_region and adj_region.owner_sect_id and adj_region.owner_sect_id != sect.id:
+                        neighbor_ids.add(adj_region.owner_sect_id)
+        return list(neighbor_ids)
+
+    def _apply_event_effect(self, sect: Sect, effect: dict):
+        """应用事件效果"""
+        resources = json.loads(sect.resources_json or "{}")
+        stats = json.loads(sect.stats_json or "{}")
+
+        if "resource_change" in effect:
+            for res, delta in effect["resource_change"].items():
+                resources[res] = resources.get(res, 0) + delta
+        if "stat_change" in effect:
+            for stat, delta in effect["stat_change"].items():
+                stats[stat] = max(0, min(1, stats.get(stat, 0.5) + delta))
+
+        sect.resources_json = json.dumps(resources)
+        sect.stats_json = json.dumps(stats)
+
+    def _execute_action(self, sect: Sect, action: dict, world_state: dict, regions: list, diplomacy: list, turn: int) -> dict | None:
+        """执行单个行动"""
+        action_type = action.get("type", "rest")
+        target_id = action.get("target_sect_id")
+        target = next((s for s in world_state["sects"] if s["id"] == target_id), None) if target_id else None
+
+        if action_type == "declare_war" and target_id:
+            return self._execute_war(sect, target, world_state, regions, diplomacy, turn)
+        elif action_type == "diplomacy_offer" and target_id:
+            return self._execute_diplomacy(sect, target, action, diplomacy, turn)
+        elif action_type == "build_structure":
+            return self._execute_build(sect, action, turn)
+        elif action_type == "train_disciples":
+            return self._execute_train(sect, action, turn)
+        elif action_type == "make_pills":
+            return self._execute_make_pills(sect, action, turn)
+        elif action_type == "craft_artifacts":
+            return self._execute_craft(sect, action, turn)
+        elif action_type == "gather_intel":
+            return self._execute_intel(sect, action, turn)
+        elif action_type == "rest":
+            return self._execute_rest(sect, turn)
+        return None
+
+    def _execute_war(self, sect: Sect, target: dict, world_state: dict, regions: list, diplomacy: list, turn: int) -> dict:
+        """执行战争"""
+        target_sect = self.db.query(Sect).filter(Sect.id == target["id"]).first()
+        if not target_sect or target_sect.status != "active":
+            return None
+
+        # 检查是否已处于战争状态
+        existing_war = any(
+            d for d in diplomacy
+            if ((d.sect_a_id == sect.id and d.sect_b_id == target["id"]) or
+                (d.sect_a_id == target["id"] and d.sect_b_id == sect.id))
+            and d.relation_type == "war"
+        )
+        if existing_war:
+            return None
+
+        # 结算战争
+        region_id = None
+        target_regions = json.loads(target_sect.controlled_regions_json or "[]")
+        if target_regions:
+            region_id = target_regions[0]
+        region = self.db.query(Region).filter(Region.id == region_id).first() if region_id else None
+
+        battle_result = self.battle_engine.resolve_battle(sect, target_sect, region)
+
+        # 应用伤亡
+        sect_stats = json.loads(sect.stats_json or "{}")
+        target_stats = json.loads(target_sect.stats_json or "{}")
+        sect_stats["military_power"] = max(0, sect_stats.get("military_power", 0) - battle_result["losses"]["attacker_loss"])
+        target_stats["military_power"] = max(0, target_stats.get("military_power", 0) - battle_result["losses"]["defender_loss"])
+        sect.stats_json = json.dumps(sect_stats)
+        target_sect.stats_json = json.dumps(target_stats)
+
+        # 处理奖励
+        rewards = battle_result["rewards"]
+        if rewards.get("spirit_stones", 0) > 0:
+            sect_resources = json.loads(sect.resources_json or "{}")
+            target_resources = json.loads(target_sect.resources_json or "{}")
+            sect_resources["spirit_stones"] = sect_resources.get("spirit_stones", 0) + rewards["spirit_stones"]
+            target_resources["spirit_stones"] = max(0, target_resources.get("spirit_stones", 0) - rewards["spirit_stones"])
+            sect.resources_json = json.dumps(sect_resources)
+            target_sect.resources_json = json.dumps(target_resources)
+
+        # 占领区域
+        for rid in rewards.get("regions_captured", []):
+            captured_region = self.db.query(Region).filter(Region.id == rid).first()
+            if captured_region:
+                captured_region.owner_sect_id = sect.id
+                sect_regions = json.loads(sect.controlled_regions_json or "[]")
+                if rid not in sect_regions:
+                    sect_regions.append(rid)
+                sect.controlled_regions_json = json.dumps(sect_regions)
+                target_regions_list = json.loads(target_sect.controlled_regions_json or "[]")
+                if rid in target_regions_list:
+                    target_regions_list.remove(rid)
+                target_sect.controlled_regions_json = json.dumps(target_regions_list)
+
+        # 更新外交关系
+        rel = self._find_diplomacy_relation(diplomacy, sect.id, target["id"])
+        if rel:
+            rel.relation_type = "war"
+            rel.relation_score = min(rel.relation_score, -0.5)
+
+        # 获取角色并生成角色战斗事件
+        attacker_chars = self._get_sect_characters(sect.id)
+        defender_chars = self._get_sect_characters(target["id"])
+        rng = random.Random(turn + hash(sect.id))
+        char_events = self.character_engine.generate_battle_character_events(
+            attacker_chars, defender_chars, battle_result, rng
+        )
+
+        # 生成战斗回放（含角色事件）
+        replay = self.battle_replay_engine.generate_replay(
+            {"name": sect.name, "id": sect.id},
+            {"name": target_sect.name, "id": target_sect.id},
+            {"name": region.name, "id": region.id} if region else None,
+            battle_result,
+            char_events,
+        )
+        battle_result["replay"] = replay
+        battle_result["character_events"] = char_events
+        battle_result["highlights"] = self.battle_replay_engine.generate_highlights(replay)
+
+        # 保存战斗记录
+        battle = Battle(
+            world_id=sect.world_id,
+            turn=turn,
+            attacker_sect_id=sect.id,
+            defender_sect_id=target["id"],
+            winner_sect_id=battle_result.get("winner_sect_id"),
+            result_type=battle_result["result_type"],
+            battle_log=battle_result["log"],
+            attacker_power=battle_result["attacker_power"],
+            defender_power=battle_result["defender_power"],
+            losses_json=json.dumps(battle_result["losses"]),
+            rewards_json=json.dumps(battle_result["rewards"]),
+            replay_json=json.dumps(replay, ensure_ascii=False),
+        )
+        self.db.add(battle)
+
         return {
-            "id": region.id,
-            "name": region.name,
-            "region_type": region.region_type,
-            "owner_sect_id": region.owner_sect_id,
-            "resource_level": region.resource_level,
-            "defense_level": region.defense_level,
-            "stability": region.stability,
-            "neighbors": json.loads(region.neighbors_json or "[]"),
+            "action": {"type": "declare_war", "target_sect_id": target["id"]},
+            "result": battle_result,
         }
 
-    def _load_relation_dict(self, rel: DiplomacyRelation) -> dict:
+    def _execute_diplomacy(self, sect: Sect, target: dict, action: dict, diplomacy: list, turn: int) -> dict:
+        """执行外交"""
+        target_sect = self.db.query(Sect).filter(Sect.id == target["id"]).first()
+        if not target_sect:
+            return None
+
+        rel = self._find_diplomacy_relation(diplomacy, sect.id, target["id"])
+        if not rel:
+            return None
+
+        offer_type = action.get("offer_type", "alliance")
+        success = random.random() < 0.5 + (rel.relation_score * 0.3)
+
+        if success:
+            if offer_type == "alliance":
+                rel.relation_type = "alliance"
+                rel.relation_score = min(1.0, rel.relation_score + 0.3)
+            elif offer_type == "trade":
+                rel.relation_type = "trade"
+                rel.relation_score = min(1.0, rel.relation_score + 0.2)
+            elif offer_type == "non_aggression":
+                rel.relation_type = "non_aggression"
+                rel.relation_score = min(1.0, rel.relation_score + 0.15)
+
+        history = json.loads(rel.history_json or "[]")
+        history.append({
+            "turn": turn,
+            "action": offer_type,
+            "success": success,
+            "initiator": sect.id,
+        })
+        rel.history_json = json.dumps(history)
+
         return {
-            "id": rel.id,
-            "sect_a_id": rel.sect_a_id,
-            "sect_b_id": rel.sect_b_id,
-            "relation_type": rel.relation_type,
-            "relation_score": rel.relation_score,
-            "trust_score": rel.trust_score,
-            "treaties": json.loads(rel.treaties_json or "[]"),
-            "history": json.loads(rel.history_json or "[]"),
+            "action": {"type": "diplomacy_offer", "target_sect_id": target["id"], "offer_type": offer_type},
+            "result": {"success": success, "relation_type": rel.relation_type},
         }
+
+    def _execute_build(self, sect: Sect, action: dict, turn: int) -> dict:
+        resources = json.loads(sect.resources_json or "{}")
+        stats = json.loads(sect.stats_json or "{}")
+        cost = 50
+        if resources.get("spirit_stones", 0) >= cost:
+            resources["spirit_stones"] -= cost
+            stats["stability"] = min(1.0, stats.get("stability", 0.5) + 0.05)
+            sect.resources_json = json.dumps(resources)
+            sect.stats_json = json.dumps(stats)
+            return {"action": action, "result": {"success": True, "stability_gain": 0.05}}
+        return {"action": action, "result": {"success": False, "reason": "资源不足"}}
+
+    def _execute_train(self, sect: Sect, action: dict, turn: int) -> dict:
+        resources = json.loads(sect.resources_json or "{}")
+        stats = json.loads(sect.stats_json or "{}")
+        cost = 30
+        if resources.get("spirit_stones", 0) >= cost:
+            resources["spirit_stones"] -= cost
+            stats["military_power"] = stats.get("military_power", 50) + random.randint(5, 15)
+            sect.resources_json = json.dumps(resources)
+            sect.stats_json = json.dumps(stats)
+            return {"action": action, "result": {"success": True, "military_gain": random.randint(5, 15)}}
+        return {"action": action, "result": {"success": False, "reason": "资源不足"}}
+
+    def _execute_make_pills(self, sect: Sect, action: dict, turn: int) -> dict:
+        resources = json.loads(sect.resources_json or "{}")
+        if resources.get("herbs", 0) >= 10:
+            resources["herbs"] -= 10
+            resources["spirit_stones"] = resources.get("spirit_stones", 0) + random.randint(20, 50)
+            sect.resources_json = json.dumps(resources)
+            return {"action": action, "result": {"success": True, "income": random.randint(20, 50)}}
+        return {"action": action, "result": {"success": False, "reason": "草药不足"}}
+
+    def _execute_craft(self, sect: Sect, action: dict, turn: int) -> dict:
+        resources = json.loads(sect.resources_json or "{}")
+        if resources.get("ores", 0) >= 10:
+            resources["ores"] -= 10
+            resources["spirit_stones"] = resources.get("spirit_stones", 0) + random.randint(15, 40)
+            sect.resources_json = json.dumps(resources)
+            return {"action": action, "result": {"success": True, "income": random.randint(15, 40)}}
+        return {"action": action, "result": {"success": False, "reason": "矿石不足"}}
+
+    def _execute_intel(self, sect: Sect, action: dict, turn: int) -> dict:
+        return {"action": action, "result": {"success": True, "intel": "收集到附近宗门的情报"}}
+
+    def _execute_rest(self, sect: Sect, turn: int) -> dict:
+        resources = json.loads(sect.resources_json or "{}")
+        stats = json.loads(sect.stats_json or "{}")
+        resources["spirit_stones"] = resources.get("spirit_stones", 0) + random.randint(10, 25)
+        stats["stability"] = min(1.0, stats.get("stability", 0.5) + 0.03)
+        sect.resources_json = json.dumps(resources)
+        sect.stats_json = json.dumps(stats)
+        return {"action": {"type": "rest"}, "result": {"success": True, "recovery": "宗门休养生息"}}
+
+    def _get_sect_characters(self, sect_id: str) -> list[dict]:
+        """获取宗门角色列表"""
+        chars = self.db.query(Character).filter(Character.sect_id == sect_id).all()
+        return [
+            {
+                "id": c.id,
+                "name": c.name,
+                "role": c.role,
+                "realm": c.realm,
+                "combat_power": c.combat_power,
+                "loyalty": c.loyalty,
+                "ambition": c.ambition,
+                "luck": c.luck,
+                "status": c.status,
+            }
+            for c in chars
+        ]
 
     def _find_diplomacy_relation(self, diplomacy: list, a_id: str, b_id: str):
         for rel in diplomacy:
@@ -454,39 +562,71 @@ class SimulationEngine:
                 return rel
         return None
 
-    def _check_annexation(self, sect_states: dict, diplomacy: list, turn: int, world_id: str):
-        """检查吞并条件"""
-        for sid, sect in sect_states.items():
-            if sect.get("status") != "active":
-                continue
-            military = sect["stats"].get("military_power", 0)
-            if military < 20:
-                continue
-            for tid, target in sect_states.items():
-                if tid == sid or target.get("status") != "active":
-                    continue
-                target_military = target["stats"].get("military_power", 0)
-                if military > target_military * 3 and len(target.get("controlled_regions", [])) <= 1:
-                    # 吞并
-                    target["status"] = "annexed"
-                    for rid in target.get("controlled_regions", []):
-                        if rid not in sect["controlled_regions"]:
-                            sect["controlled_regions"].append(rid)
-                    sect["stats"]["stability"] = max(0.1, sect["stats"].get("stability", 0.5) - 0.2)
-                    evt = WorldEvent(
-                        id=uuid.uuid4().hex[:12],
-                        world_id=world_id,
-                        turn=turn,
-                        event_type="annexation",
-                        title="宗门吞并",
-                        description=f"{sect['name']} 吞并了 {target['name']}！",
-                        severity=0.9,
-                        affected_sects_json=json.dumps([sid, tid], ensure_ascii=False),
-                        affected_regions_json=json.dumps([], ensure_ascii=False),
-                        tags_json=json.dumps(["吞并", "灭门"], ensure_ascii=False),
-                        raw_result_json=json.dumps({}, ensure_ascii=False),
-                    )
-                    self.db.add(evt)
+    def _build_agent_messages(self, sect_state: dict, world_state: dict) -> list[dict]:
+        """构建 LLM Agent 的 messages"""
+        system_prompt = """你是一位修仙宗门的掌门 Agent。你必须根据宗门性格、当前资源、外交关系、地图局势做出本回合战略决策。
+你必须输出合法 JSON，格式如下：
+{
+  "strategy_summary": "本回合战略摘要，不超过80字",
+  "actions": [
+    {
+      "type": "declare_war|diplomacy_offer|build_structure|train_disciples|make_pills|craft_artifacts|gather_intel|rest",
+      "target_sect_id": "目标宗门ID或null",
+      "target_region_id": "目标区域ID或null",
+      "intensity": "low|medium|high",
+      "message": "行动描述"
+    }
+  ]
+}
+可选行动类型：
+- declare_war: 宣战（消耗2行动点）
+- diplomacy_offer: 外交提议（结盟/贸易/互不侵犯，消耗1行动点）
+- build_structure: 建设设施（消耗1行动点）
+- train_disciples: 训练弟子（消耗1行动点）
+- make_pills: 炼丹（消耗1行动点）
+- craft_artifacts: 炼器（消耗1行动点）
+- gather_intel: 收集情报（消耗1行动点）
+- rest: 休养生息（恢复资源，消耗0行动点）
+每回合最多3个行动点。"""
+
+        user_prompt = json.dumps({
+            "self": sect_state,
+            "world": {
+                "sects": [s for s in world_state.get("sects", []) if s.get("id") != sect_state.get("id")],
+                "regions": world_state.get("regions", []),
+                "diplomacy": world_state.get("diplomacy", []),
+            },
+        }, ensure_ascii=False, default=str)
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _parse_llm_output(self, output: dict, sect: Sect) -> dict:
+        """解析 LLM 输出为行动格式"""
+        actions = []
+        if isinstance(output, dict):
+            raw_actions = output.get("actions", [])
+            if isinstance(raw_actions, list):
+                for a in raw_actions:
+                    if isinstance(a, dict):
+                        actions.append({
+                            "type": a.get("type", "rest"),
+                            "target_sect_id": a.get("target_sect_id"),
+                            "target_region_id": a.get("target_region_id"),
+                            "intensity": a.get("intensity", "medium"),
+                            "message": a.get("message", ""),
+                        })
+
+        # 如果没有解析出行动，默认休息
+        if not actions:
+            actions = [{"type": "rest", "message": "休养生息"}]
+
+        return {
+            "strategy_summary": output.get("strategy_summary", "按兵不动") if isinstance(output, dict) else "按兵不动",
+            "actions": actions[:3],  # 最多3个行动
+        }
 
     def _generate_turn_summary(self, results: list, events: list, turn: int) -> str:
         """生成回合摘要"""
