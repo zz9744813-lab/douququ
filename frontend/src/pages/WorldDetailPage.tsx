@@ -1,7 +1,7 @@
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
-import type { DiplomacyGraph } from '../api/client';
+// DiplomacyGraph type used via API client return type inference
 import * as echarts from 'echarts';
 import { useEffect, useRef } from 'react';
 
