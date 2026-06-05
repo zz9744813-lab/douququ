@@ -22,6 +22,8 @@ class Region(Base):
     resource_level = Column(Integer, default=1)
     defense_level = Column(Integer, default=1)
     stability = Column(Float, default=1.0)
+    pos_x = Column(Float, default=0.0)
+    pos_y = Column(Float, default=0.0)
     neighbors_json = Column(Text, nullable=False, default="[]")
     special_flags_json = Column(Text, nullable=False, default="[]")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
