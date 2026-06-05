@@ -180,6 +180,82 @@ def get_turn_records(world_id: str, db: Session = Depends(get_db)):
     return [{"id": r.id, "turn": r.turn, "status": r.status, "summary": r.summary} for r in records]
 
 
+@router.get("/{world_id}/turns/{turn}")
+def get_turn_detail(world_id: str, turn: int, db: Session = Depends(get_db)):
+    """获取回合详情（含所有行动结果和战斗回放）"""
+    record = db.query(TurnRecord).filter(TurnRecord.world_id == world_id, TurnRecord.turn == turn).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="回合不存在")
+
+    return {
+        "id": record.id,
+        "turn": record.turn,
+        "status": record.status,
+        "summary": record.summary,
+        "actions": json.loads(record.agent_actions_json or "{}"),
+        "results": json.loads(record.resolved_results_json or "[]"),
+    }
+
+
+@router.get("/{world_id}/turns/{turn}/replay")
+def get_turn_replay(world_id: str, turn: int, db: Session = Depends(get_db)):
+    """获取回合回放数据（按时间顺序排列的所有事件）"""
+    record = db.query(TurnRecord).filter(TurnRecord.world_id == world_id, TurnRecord.turn == turn).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="回合不存在")
+
+    # 获取该回合的所有事件
+    events = db.query(WorldEvent).filter(
+        WorldEvent.world_id == world_id,
+        WorldEvent.turn == turn,
+    ).order_by(WorldEvent.severity.desc()).all()
+
+    # 获取该回合的所有战斗
+    battles = db.query(Battle).filter(
+        Battle.world_id == world_id,
+        Battle.turn == turn,
+    ).all()
+
+    # 构建时间线
+    timeline = []
+
+    # 添加事件
+    for e in events:
+        timeline.append({
+            "type": "event",
+            "event_type": e.event_type,
+            "title": e.title,
+            "description": e.description,
+            "severity": e.severity,
+            "affected_sects": json.loads(e.affected_sects_json or "[]"),
+        })
+
+    # 添加战斗（含回放）
+    for b in battles:
+        timeline.append({
+            "type": "battle",
+            "title": f"{b.battle_log[:30]}...",
+            "description": b.battle_log,
+            "result_type": b.result_type,
+            "attacker_sect_id": b.attacker_sect_id,
+            "defender_sect_id": b.defender_sect_id,
+            "winner_sect_id": b.winner_sect_id,
+            "attacker_power": b.attacker_power,
+            "defender_power": b.defender_power,
+            "losses": json.loads(b.losses_json or "{}"),
+            "rewards": json.loads(b.rewards_json or "{}"),
+        })
+
+    # 按严重程度排序
+    timeline.sort(key=lambda x: x.get("severity", 0.5), reverse=True)
+
+    return {
+        "turn": turn,
+        "summary": record.summary,
+        "timeline": timeline,
+    }
+
+
 # --- Helper functions ---
 
 def _world_to_dict(w: World) -> dict:
