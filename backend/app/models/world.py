@@ -34,3 +34,7 @@ class World(Base):
     turn_records = relationship("TurnRecord", back_populates="world", cascade="all, delete-orphan")
     battles = relationship("Battle", back_populates="world", cascade="all, delete-orphan")
     diplomacy_relations = relationship("DiplomacyRelation", back_populates="world", cascade="all, delete-orphan")
+    diplomacy_proposals = relationship("DiplomacyProposal", back_populates="world", cascade="all, delete-orphan")
+    audience_predictions = relationship("AudiencePrediction", back_populates="world", cascade="all, delete-orphan")
+    audience_interventions = relationship("AudienceIntervention", back_populates="world", cascade="all, delete-orphan")
+    characters = relationship("Character", back_populates="world", cascade="all, delete-orphan")

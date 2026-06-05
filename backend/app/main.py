@@ -31,11 +31,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import worlds, turns, audience, settings
+from app.routers import worlds, turns, audience, settings, leaderboard
 app.include_router(worlds.router)
 app.include_router(turns.router)
 app.include_router(audience.router)
 app.include_router(settings.router)
+app.include_router(leaderboard.router)
 
 
 # WebSocket connections
