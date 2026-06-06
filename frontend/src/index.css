@@ -1,18 +1,280 @@
 @import "tailwindcss";
 
+/* ============================================================
+   Theme Tokens — 墨韵修仙电竞风格
+   ============================================================ */
+@theme {
+  /* Ink — 墨色系 */
+  --color-ink-50:  #f5f5f7;
+  --color-ink-100: #e8e8ed;
+  --color-ink-200: #c8c8d4;
+  --color-ink-300: #a0a0b4;
+  --color-ink-400: #787894;
+  --color-ink-500: #5a5a78;
+  --color-ink-600: #46466a;
+  --color-ink-700: #36365a;
+  --color-ink-800: #28284a;
+  --color-ink-900: #1c1c3a;
+  --color-ink-950: #12121e;
+
+  /* Jade — 翡翠绿 */
+  --color-jade-50:  #edfcf5;
+  --color-jade-100: #d1f8e5;
+  --color-jade-200: #a5f0cd;
+  --color-jade-300: #6ae5af;
+  --color-jade-400: #3ad193;
+  --color-jade-500: #16b87a;
+  --color-jade-600: #0d9465;
+  --color-jade-700: #0b7653;
+  --color-jade-800: #0e5d44;
+  --color-jade-900: #0c4d39;
+  --color-jade-950: #032b21;
+
+  /* Gold — 金色 */
+  --color-gold-50:  #fefce8;
+  --color-gold-100: #fef9c3;
+  --color-gold-200: #fef08a;
+  --color-gold-300: #fde047;
+  --color-gold-400: #facc15;
+  --color-gold-500: #eab308;
+  --color-gold-600: #ca8a04;
+  --color-gold-700: #a16207;
+  --color-gold-800: #854d0e;
+  --color-gold-900: #713f12;
+  --color-gold-950: #422006;
+
+  /* Vermilion — 朱砂红 */
+  --color-vermilion-50:  #fef1f1;
+  --color-vermilion-100: #fde0e0;
+  --color-vermilion-200: #fcc5c5;
+  --color-vermilion-300: #f9a0a0;
+  --color-vermilion-400: #f46b6b;
+  --color-vermilion-500: #ef4444;
+  --color-vermilion-600: #dc2626;
+  --color-vermilion-700: #b91c1c;
+  --color-vermilion-800: #991b1b;
+  --color-vermilion-900: #7f1d1d;
+  --color-vermilion-950: #450a0a;
+
+  /* Font families */
+  --font-serif: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+  --font-sans: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+/* ============================================================
+   Base Styles
+   ============================================================ */
 body {
   margin: 0;
-  background: #0f172a;
-  color: #e2e8f0;
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 #root {
   min-height: 100vh;
 }
 
-/* Custom scrollbar */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #1e293b; }
-::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #64748b; }
+/* ============================================================
+   8 Keyframe Animations
+   ============================================================ */
+
+/* 1. pulse-glow — 脉冲光晕 */
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px 1px rgba(22, 184, 122, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 16px 4px rgba(22, 184, 122, 0.6);
+  }
+}
+
+/* 2. ink-spread — 墨韵扩散 */
+@keyframes ink-spread {
+  0% {
+    transform: scale(0);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+
+/* 3. battle-flash — 战斗闪光 */
+@keyframes battle-flash {
+  0% {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.9);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(0) scale(1.05);
+  }
+  30% {
+    transform: scale(1);
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+}
+
+/* 4. fade-slide-up — 淡入上滑 */
+@keyframes fade-slide-up {
+  0% {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 5. gold-breathe — 金色呼吸 */
+@keyframes gold-breathe {
+  0%, 100% {
+    color: var(--color-gold-400);
+    text-shadow: 0 0 8px rgba(250, 204, 21, 0.3);
+  }
+  50% {
+    color: var(--color-gold-300);
+    text-shadow: 0 0 20px rgba(250, 204, 21, 0.6);
+  }
+}
+
+/* 6. skeleton-shimmer — 骨架屏微光 */
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+/* 7. ticker-scroll — 跑马灯滚动 */
+@keyframes ticker-scroll {
+  0% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+/* 8. elimination-fade — 宗门覆灭淡出 */
+@keyframes elimination-fade {
+  0% {
+    opacity: 0;
+    background-color: rgba(69, 10, 10, 0);
+  }
+  20% {
+    opacity: 1;
+    background-color: rgba(69, 10, 10, 0.85);
+  }
+  80% {
+    opacity: 1;
+    background-color: rgba(69, 10, 10, 0.85);
+  }
+  100% {
+    opacity: 0;
+    background-color: rgba(69, 10, 10, 0);
+  }
+}
+
+/* ============================================================
+   Utility Classes
+   ============================================================ */
+
+/* 脉冲光晕动画 */
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* 骨架屏微光动画 */
+.animate-skeleton {
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    var(--color-ink-800) 25%,
+    var(--color-ink-700) 50%,
+    var(--color-ink-800) 75%
+  );
+  background-size: 200% 100%;
+  border-radius: 4px;
+}
+
+/* 墨洗背景 */
+.ink-wash-bg {
+  background: radial-gradient(
+    ellipse at 30% 20%,
+    rgba(28, 28, 58, 0.6) 0%,
+    var(--color-ink-950) 70%
+  );
+}
+
+/* 电竞边框光晕 */
+.esports-border-glow {
+  border: 1px solid var(--color-ink-700);
+  box-shadow:
+    0 0 0 1px rgba(22, 184, 122, 0.05),
+    0 0 12px -4px rgba(22, 184, 122, 0.15);
+  transition: box-shadow 0.3s ease;
+}
+
+.esports-border-glow:hover {
+  box-shadow:
+    0 0 0 1px rgba(22, 184, 122, 0.15),
+    0 0 20px -2px rgba(22, 184, 122, 0.3);
+}
+
+/* 宗门选中态 */
+.sect-selected {
+  border-color: var(--color-jade-500) !important;
+  box-shadow:
+    0 0 0 1px var(--color-jade-500),
+    0 0 16px -2px rgba(22, 184, 122, 0.4);
+}
+
+/* 宗门覆灭动画 */
+.animate-elimination {
+  animation: elimination-fade 3s ease-in-out forwards;
+}
+
+/* ============================================================
+   Custom Scrollbar — 墨色系
+   ============================================================ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-ink-900);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink-600);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-500);
+}
+
+::-webkit-scrollbar-corner {
+  background: var(--color-ink-900);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) var(--color-ink-900);
+}
